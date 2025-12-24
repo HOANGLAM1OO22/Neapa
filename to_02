@@ -1,0 +1,143 @@
+class GpuFrameNormalizer(
+    private val targetW: Int,
+    private val targetH: Int
+) : AutoCloseable {
+
+    private val program = GlProgram(
+        NORMALIZE_VERTEX,
+        NORMALIZE_FRAGMENT
+    )
+
+    private val aPos = GLES20.glGetAttribLocation(program.programId, "aPosition")
+    private val aTex = GLES20.glGetAttribLocation(program.programId, "aTexCoord")
+
+    private val uRotation = GLES20.glGetUniformLocation(program.programId, "uRotation")
+    private val uScale = GLES20.glGetUniformLocation(program.programId, "uScale")
+    private val uOffset = GLES20.glGetUniformLocation(program.programId, "uOffset")
+    private val uTexture = GLES20.glGetUniformLocation(program.programId, "uTexture")
+
+    private val vertexBuffer: FloatBuffer =
+        ByteBuffer.allocateDirect(VERTEX_DATA.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .apply {
+                put(VERTEX_DATA)
+                position(0)
+            }
+
+    fun normalize(src: Bitmap, rotation: Int): NormalizedTexture {
+
+        // ========== 1) upload bitmap ==========
+        val srcTex = Texture2D(src)
+
+        // ========== 2) CPU math — IDENTICAL TO FrameNormalizer ==========
+        val needSwap = rotation % 180 != 0
+
+        val logicalSrcW = if (needSwap) src.height else src.width
+        val logicalSrcH = if (needSwap) src.width else src.height
+
+        val scale = maxOf(
+            targetW.toFloat() / logicalSrcW,
+            targetH.toFloat() / logicalSrcH
+        )
+
+        val scaledW = logicalSrcW * scale
+        val scaledH = logicalSrcH * scale
+
+        val uScaleVal = targetW / scaledW
+        val vScaleVal = targetH / scaledH
+
+        val uOffsetVal = (1f - uScaleVal) / 2f
+        val vOffsetVal = (1f - vScaleVal) / 2f
+
+        // ========== 3) create output texture ==========
+        val outTex = IntArray(1)
+        GLES20.glGenTextures(1, outTex, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, outTex[0])
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D,
+            0,
+            GLES20.GL_RGBA,
+            targetW,
+            targetH,
+            0,
+            GLES20.GL_RGBA,
+            GLES20.GL_UNSIGNED_BYTE,
+            null
+        )
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        // ========== 4) FBO ==========
+        val fbo = IntArray(1)
+        GLES20.glGenFramebuffers(1, fbo, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER,
+            GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D,
+            outTex[0],
+            0
+        )
+
+        check(
+            GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+                    == GLES20.GL_FRAMEBUFFER_COMPLETE
+        )
+
+        GLES20.glViewport(0, 0, targetW, targetH)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        // ========== 5) draw ==========
+        program.use()
+
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPos)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+
+        vertexBuffer.position(2)
+        GLES20.glEnableVertexAttribArray(aTex)
+        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+
+        GLES20.glUniform1i(uRotation, ((rotation % 360) + 360) % 360)
+        GLES20.glUniform2f(uScale, uScaleVal, vScaleVal)
+        GLES20.glUniform2f(uOffset, uOffsetVal, vOffsetVal)
+
+        srcTex.bind(0)
+        GLES20.glUniform1i(uTexture, 0)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        // ========== 6) cleanup ==========
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glDeleteFramebuffers(1, fbo, 0)
+        srcTex.close()
+
+        return NormalizedTexture(outTex[0], targetW, targetH)
+    }
+
+    override fun close() {
+        program.close()
+    }
+
+    companion object {
+        private val VERTEX_DATA = floatArrayOf(
+            -1f, -1f, 0f, 1f,
+             1f, -1f, 1f, 1f,
+            -1f,  1f, 0f, 0f,
+             1f,  1f, 1f, 0f
+        )
+
+        private const val NORMALIZE_VERTEX = /* vertex shader string above */
+        private const val NORMALIZE_FRAGMENT = """
+            precision mediump float;
+            uniform sampler2D uTexture;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_FragColor = texture2D(uTexture, vTexCoord);
+            }
+        """
+    }
+}
